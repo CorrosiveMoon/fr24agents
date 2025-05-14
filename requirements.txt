@@ -1,0 +1,20 @@
+# Core LangGraph and LangChain components
+langgraph
+
+# For loading environment variables
+python-dotenv
+
+# For making HTTP requests (used in fr24_api.py)
+requests
+
+# For interacting with various LLMs (used by ADK agents)
+litellm
+
+# OpenAI client library (if using OpenAI models via LiteLLM)
+openai
+
+# Potentially required for Google ADK components.
+# If 'google-adk' is the correct PyPI name, uncomment the line below.
+# Otherwise, you may need to install this from a different source or
+# it might be included if 'litellm' or another Google library provides it.
+google-adk

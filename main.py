@@ -1,76 +1,94 @@
-# main.py
-
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt.tool_executor import ToolExecutor
-from langchain_core.messages import HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
-
-from flight_status_agent.agent import root_agent as flight_agent
-from airport_status_agent.agent import root_agent as airport_agent
-
-from dotenv import load_dotenv
 import os
+import asyncio
+from dotenv import load_dotenv
 
-load_dotenv()
+from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, MessagesState, START, END
 
-#wrapping agents using the toolexec
-flight_tool = ToolExecutor([flight_agent])
-airport_tool = ToolExecutor([airport_agent])
+from google.adk.agents import Agent
+from google.adk.sessions import InMemorySessionService
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.runners import Runner
+from google.genai import types
 
-#state handler
-def route_step(state):
-    last_input = state["messages"][-1].content.lower()
-    if "flight" in last_input or any(char.isdigit() for char in last_input):
-        return "flight_status"
-    elif "airport" in last_input or any(code in last_input for code in ["CAI", "DXB", "JFK"]):
-        return "airport_status"
-    else:
-        return "end"
+from flight_status_agent.flight_agent import flight_agent
+from airport_status_agent.airport_agent import airport_agent
+from greeting_agent.greeting_agent import greeting_agent
+from farewell_agent.farwell_agent import farewell_agent
 
-#node functions for langraph
-def call_flight_agent(state):
-    result = flight_tool.invoke(state["messages"])
-    state["messages"].extend(result)
-    return state
+# environment variables
+load_dotenv()  # FR24_API_TOKEN, OPENAI_API_KEY, etc.
 
-def call_airport_agent(state):
-    result = airport_tool.invoke(state["messages"])
-    state["messages"].extend(result)
-    return state
+# Define and create your ADK root agent and runner here, from google adk examples
+root_agent = Agent(
+    name="aviation_root",
+    model=LiteLlm(model="openai/gpt-4o-mini"),
+    description="Coordinator for flights, airports, greetings, farewells.",
+    instruction=(
+    "You are an AI assistant specialized in aviation: flights, airports, and related details like status, destination, ETA, delays, and coordinates. "
+    "You also handle greetings and farewells. "
+    "If the user asks something clearly unrelated to aviation, greetings, or farewells, respond with: 'I’m sorry, I can only answer aviation-related questions.' "
+    "Otherwise, delegate the request to the correct sub-agent: flight_agent (for anything about flights), airport_agent (for airports), "
+    "greeting_agent (for greetings), or farewell_agent (for goodbyes). Follow-up questions like 'Where is it going?' or 'What's the ETA?' should be treated as flight-related."
+    ),
 
-#LangGraph flow and adding niodes
-builder = StateGraph()
-builder.add_node("flight_status", call_flight_agent)
-builder.add_node("airport_status", call_airport_agent)
-
-builder.set_entry_point(route_step)
-builder.add_conditional_edges(
-    route_step,
-    {
-        "flight_status": "flight_status",
-        "airport_status": "airport_status",
-        "end": END
-    }
+    sub_agents=[flight_agent, airport_agent, greeting_agent, farewell_agent],
+)
+session_service = InMemorySessionService()
+runner = Runner(
+    agent=root_agent,
+    app_name="mcp_demo_app",
+    session_service=session_service,
 )
 
-builder.add_edge("flight_status", END)
-builder.add_edge("airport_status", END)
+#initial session for CLI
+session_service.create_session(
+    app_name="mcp_demo_app",
+    user_id="user1",
+    session_id="main_session"
+)
+
+#adapter node: send last human message into ADK runner and capture the final response
+def call_adk(state: MessagesState):
+    last_text = state["messages"][-1].content
+    content = types.Content(role="user", parts=[types.Part(text=last_text)])
+
+    async def invoke():
+        final = None
+        async for event in runner.run_async(
+            user_id="user1",
+            session_id="main_session",
+            new_message=content
+        ):
+            if event.is_final_response():
+                if event.content and event.content.parts:
+                    final = event.content.parts[0].text
+                break
+        return final or ""
+
+    response_text = asyncio.run(invoke())
+    return {"messages": [AIMessage(content=response_text)]}
+
+#LangGraph flow
+builder = StateGraph(MessagesState)
+builder.add_node("adk_call", call_adk)
+builder.add_edge(START, "adk_call")
+# Directly end after ADK call
+builder.add_edge("adk_call", END)
 
 graph = builder.compile()
 
-#testing
-print("Ask about a flight or airport (e.g. 'Is MS981 on time?' or 'Any delays at CAI?')\n")
+def main():
+    print("Ask about flights, airports, hello, or bye. Type 'exit' to quit.")
+    while True:
+        q = input("You: ").strip()
+        if q.lower() in {"exit", "quit"}:
+            break
+        state = {"messages": [HumanMessage(content=q)]}
+        result = graph.invoke(state)
+        print("\nAI:", result["messages"][-1].content, "\n")
 
-while True:
-    query = input("You: ")
-    if query.lower() in ["exit", "quit"]:
-        break
 
-    state = {
-        "messages": [HumanMessage(content=query)]
-    }
-
-    result = graph.invoke(state, config=RunnableConfig())
-    response = result["messages"][-1]
-
-    print(f"\n AI: {response.content}\n")
+main()
